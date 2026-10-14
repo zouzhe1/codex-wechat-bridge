@@ -1,0 +1,26 @@
+{
+  "name": "codex-wechat-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Codex <-> WeChat bridge plugin over the official iLink protocol (OpeniLink SDK as protocol layer)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zouzhe1/codex-wechat-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/zouzhe1/codex-wechat-bridge/issues"
+  },
+  "homepage": "https://github.com/zouzhe1/codex-wechat-bridge#readme",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "node scripts/check.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@openilink/openilink-sdk-node": "^0.6.0"
+  }
+}

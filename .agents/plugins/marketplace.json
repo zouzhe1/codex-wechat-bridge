@@ -1,0 +1,13 @@
+{
+  "name": "wechat-bridge",
+  "interface": { "displayName": "WeChat Bridge Marketplace" },
+  "plugins": [
+    {
+      "name": "wechat-bridge",
+      "source": "./",
+      "category": "Productivity",
+      "description": "WeChat (official iLink protocol) bridge: task notifications, two-way chat, Markdown, images.",
+      "version": "0.1.0"
+    }
+  ]
+}

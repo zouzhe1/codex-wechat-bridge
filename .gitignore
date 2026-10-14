@@ -1,0 +1,15 @@
+# dependencies
+node_modules/
+
+# generated locally by install.ps1 (contains machine-specific absolute paths)
+scripts/bridge-run.cmd
+
+# runtime artifacts (these live in ~/.codex-wechat-bridge, but just in case)
+*.log
+login-*.png
+*.tmp
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini

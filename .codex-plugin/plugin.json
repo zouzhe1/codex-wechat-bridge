@@ -1,0 +1,24 @@
+{
+  "name": "wechat-bridge",
+  "version": "0.1.0",
+  "description": "WeChat (official iLink protocol) bridge for Codex: task-completion notifications, two-way messaging, Markdown rendering, images and files.",
+  "author": { "name": "codex-wechat-bridge contributors" },
+  "license": "MIT",
+  "repository": "https://github.com/zouzhe1/codex-wechat-bridge",
+  "keywords": ["wechat", "ilink", "notification", "bridge"],
+  "skills": "./skills",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "WeChat Bridge",
+    "shortDescription": "任务完成微信通知与双向消息(官方 iLink 协议)",
+    "longDescription": "通过腾讯官方 iLink 协议把 Codex 接进微信: 任务完成自动通知、双向对话驱动任务、Markdown 自动转微信排版、收发图片与文件、24h 窗口排队与桌面提醒、开机自启看门狗。需扫码绑定本人微信号。",
+    "developerName": "codex-wechat-bridge",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": [
+      "通过微信把刚才的结果发给我",
+      "查看微信连接状态",
+      "把这张截图发到我微信"
+    ]
+  }
+}
