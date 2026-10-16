@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Store } from '../scripts/store.mjs';
 import { Channel, ChannelError } from '../scripts/channel.mjs';
-import { worker, startWorker, stopWorker, makeLocalRunner } from '../scripts/worker.mjs';
+import { worker, startWorker, stopWorker, makeLocalRunner, taskName } from '../scripts/worker.mjs';
 import { flushOutbox } from '../scripts/outbox.mjs';
 import { mockFetch, tempDir, cleanup } from './helpers.mjs';
 
@@ -91,6 +91,16 @@ test('localRunner rethrows non-retryable failures instead of jamming the outbox'
   assert.equal((await store.read()).outbox.length, 0);
 });
 
+test('taskName derives a short human label from the prompt', () => {
+  assert.equal(taskName('优化 README 结构\n\n第二行'), '优化 README 结构');
+  assert.equal(taskName('新任务 修复登录 bug'), '修复登录 bug');
+  assert.equal(taskName('/new 清理临时文件'), '清理临时文件');
+  assert.equal(taskName('  多   个 空格  '), '多 个 空格');
+  assert.equal(taskName('x'.repeat(40)), 'x'.repeat(24) + '…');
+  assert.equal(taskName(''), '未命名任务');
+  assert.equal(taskName(undefined), '未命名任务');
+});
+
 test('M2 golden path: inbound task → busy guard → codex exec → result → flush delivers', async t => {
   const dir = await tempDir(); t.after(() => cleanup(dir));
   const store = new Store(dir);
@@ -131,8 +141,8 @@ test('M2 golden path: inbound task → busy guard → codex exec → result → 
 
   // start ack + busy reply go out directly (window is open)
   await waitFor(() => sentTexts.length >= 2, 5000, 'start ack + busy reply');
-  assert.match(sentTexts[0], /已开始执行任务/);
-  assert.match(sentTexts[1], /上一个任务还在运行/);
+  assert.match(sentTexts[0], /任务 #1 已开始:测试任务/);
+  assert.match(sentTexts[1], /还在运行/);
 
   // finish the fake codex → the result lands in the outbox
   resolveDone();
@@ -141,21 +151,30 @@ test('M2 golden path: inbound task → busy guard → codex exec → result → 
     return (s.outbox || []).find(o => o.notification_id.startsWith('result:'));
   }, 5000, 'result enqueued');
   assert.equal(queued.format, 'markdown');
+  assert.match(queued.title, /✅ Codex 任务完成 · #1 测试任务/);
 
   // flush delivers it as converted, chunked text
   const before = sentTexts.length;
   const r = await flushOutbox(store, channel);
   assert.equal(r.flushed, 1);
   const delivered = sentTexts.slice(before).join('\n');
-  assert.match(delivered, /✅ Codex 任务完成/);
+  assert.match(delivered, /✅ Codex 任务完成 · #1 测试任务/);
   assert.match(delivered, /任务完成正文/);
-  assert.match(delivered, new RegExp(THREAD), 'thread id footer survives');
+  assert.match(delivered, /—— 任务 #1 测试任务/, 'human-readable task footer');
+  assert.ok(!delivered.includes(THREAD), 'raw UUIDs must never reach the user');
   assert.ok(!delivered.includes('##'), 'markdown markers converted');
 
   // bookkeeping
   const final = await store.read();
   assert.equal(final.receiver.threadId, THREAD, 'thread id persisted for resume');
   assert.equal(final.receiver.job.status, 'completed');
+  assert.equal(final.receiver.job.no, 1, 'task carries a human-readable number');
+  assert.equal(final.receiver.taskSeq, 1);
+  assert.equal(final.tasks.length, 1);
+  assert.equal(final.tasks[0].no, 1);
+  assert.equal(final.tasks[0].name, '测试任务');
+  assert.equal(final.tasks[0].status, 'completed');
+  assert.equal(final.tasks[0].threadId, THREAD, 'registry maps task number back to the codex thread');
   assert.equal((final.messages || []).length, 2, 'inbound history recorded');
   assert.equal(final.outbox.length, 0);
 

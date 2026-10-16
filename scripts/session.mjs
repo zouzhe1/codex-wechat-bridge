@@ -46,6 +46,12 @@ export function publicStatus(state, now = Date.now()) {
     last_error: state.receiver?.lastError,
     notify_mode: state.settings?.notify_mode || 'on-demand',
     has_cursor: typeof account?.cursor === 'string' && account.cursor.length > 0,
+    current_task: state.receiver?.job?.status === 'running'
+      ? { no: state.receiver.job.no, name: state.receiver.job.name, started_at: state.receiver.job.startedAt }
+      : undefined,
+    recent_tasks: (state.tasks || []).slice(-5).reverse()
+      .map(t => ({ no: t.no, name: t.name, status: t.status,
+        ...(t.finishedAt ? { finished_at: t.finishedAt } : {}) })),
   };
 }
 

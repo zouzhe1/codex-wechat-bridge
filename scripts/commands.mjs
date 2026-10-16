@@ -2,12 +2,12 @@ import { publicStatus } from './session.mjs';
 
 export const HELP = [
   '【微信 ↔ Codex 桥】可用指令:',
-  '• 进度 / 状态 — 查看连接与任务状态',
+  '• 进度 / 状态 — 连接、窗口、队列与任务列表(任务有编号 #N)',
   '• 连接测试 — 探活',
   '• 停止 — 中止当前任务',
   '• 新任务 <描述> — 开新会话',
   '• 帮助 — 显示本条',
-  '其余内容将作为任务交给 Codex 执行。',
+  '其余内容将作为任务交给 Codex 执行,结果以 #编号 回报。',
 ].join('\n');
 
 /** Command word table — case-insensitive exact match; anything else is a task prompt. */
@@ -31,6 +31,26 @@ const ERROR_HINTS = {
   NETWORK_ERROR: '网络波动,自动重试中',
 };
 
+const TASK_ICONS = { completed: '✅', failed: '❌', timed_out: '⏰', stopped: '🛑', interrupted: '⚠️' };
+
+function taskLines(state) {
+  const lines = [];
+  const job = state.receiver?.job;
+  if (job?.status === 'running' && job.no) {
+    const mins = Math.max(1, Math.round((Date.now() - job.startedAt) / 60_000));
+    lines.push(`进行中: #${job.no} ${job.name}(${mins} 分钟)`);
+  }
+  const recent = (state.tasks || []).filter(t => t.status !== 'running').slice(-4).reverse();
+  if (recent.length) {
+    lines.push('近期任务:');
+    for (const t of recent) {
+      const mins = t.finishedAt ? Math.max(1, Math.round((Date.now() - t.finishedAt) / 60_000)) : null;
+      lines.push(`• #${t.no} ${t.name} ${TASK_ICONS[t.status] || ''}${mins ? ` ${mins} 分钟前` : ''}`);
+    }
+  }
+  return lines;
+}
+
 export function statusText(state) {
   const s = publicStatus(state);
   const lines = [
@@ -39,6 +59,7 @@ export function statusText(state) {
     `窗口剩余: ${s.window_remaining_ms > 0 ? Math.round(s.window_remaining_ms / 60_000) + ' 分钟' : (s.window_expired ? '已过期(发一条消息即恢复)' : '—')}`,
     `待发消息: ${s.pending_messages} 条入站 / ${s.pending_notifications} 条出站`,
   ];
+  lines.push(...taskLines(state));
   if (s.blocked_until) lines.push(`风控冷却至: ${s.blocked_until}`);
   const hint = state.receiver?.queueReason || ERROR_HINTS[state.receiver?.lastError];
   if (hint) lines.push(`提示: ${hint}`);

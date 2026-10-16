@@ -32,3 +32,24 @@ test('statusText reports window state and never exposes credentials', () => {
   assert.ok(!text.includes('SECRET'), 'credentials leaked into status text');
   assert.ok(PENDING_TASK_REPLY.length > 0 && HELP.includes('连接测试'));
 });
+
+test('statusText lists the running task and recent task history', () => {
+  const now = Date.now();
+  const state = {
+    version: 1, notifications: [], outbox: [], inbox: [],
+    account: { token: 't', userId: 'u', contextToken: 'c', lastInboundAt: now - 1000 },
+    receiver: { enabled: true, pid: process.pid, heartbeat: now,
+      job: { no: 7, name: '重构登录模块', status: 'running', startedAt: now - 5 * 60_000 } },
+    tasks: [
+      { no: 5, name: '查看目录结构', status: 'completed', finishedAt: now - 60 * 60_000 },
+      { no: 6, name: '修复打包脚本', status: 'failed', finishedAt: now - 30 * 60_000 },
+      { no: 7, name: '重构登录模块', status: 'running', startedAt: now - 5 * 60_000 },
+    ],
+  };
+  const text = statusText(state);
+  assert.ok(text.includes('进行中: #7 重构登录模块(5 分钟)'), text);
+  assert.ok(text.includes('近期任务:'), text);
+  assert.ok(text.includes('• #6 修复打包脚本 ❌ 30 分钟前'), text);
+  assert.ok(text.includes('• #5 查看目录结构 ✅ 60 分钟前'), text);
+  assert.ok(!/#[0-9a-f]{8}-/.test(text), 'no raw UUIDs may reach the user');
+});

@@ -69,7 +69,15 @@ async function queueToastNotice(store, pending) {
   }).catch(() => {});
 }
 
-function resultMessage(result) {
+/** Human-readable task label from the prompt: first line, trimmed to 24 chars. */
+export function taskName(prompt) {
+  const line = String(prompt || '').split('\n').map(l => l.trim()).find(Boolean) || '';
+  const cleaned = line.replace(/^(?:新任务|\/new)\s*/i, '').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return '未命名任务';
+  return cleaned.length > 24 ? cleaned.slice(0, 24) + '…' : cleaned;
+}
+
+function resultMessage(result, no, name) {
   const heads = {
     completed: '✅ Codex 任务完成',
     failed: '❌ Codex 任务失败',
@@ -77,9 +85,10 @@ function resultMessage(result) {
     stopped: '🛑 Codex 任务已停止',
     interrupted: '⚠️ Codex 任务中断',
   };
-  const title = heads[result.status] || 'Codex 任务结束';
+  const label = no ? ` · #${no} ${name}` : '';
+  const title = (heads[result.status] || 'Codex 任务结束') + label;
   const body = (result.finalMessage || '').trim() || `(没有文本输出,状态: ${result.status})`;
-  const footer = result.threadId ? `\n\n—— 任务 ${result.threadId}` : '';
+  const footer = no ? `\n\n—— 任务 #${no} ${name}` : '';
   return { title, message: body + footer };
 }
 
@@ -134,7 +143,11 @@ export async function worker({
         enabled: true, pid: process.pid, nonce, heartbeat: Date.now(), startedAt: Date.now(),
         threadId: prev.threadId, job: prev.job,
       };
-      if (s.receiver.job?.status === 'running') s.receiver.job.status = 'interrupted';
+      if (s.receiver.job?.status === 'running') {
+        s.receiver.job.status = 'interrupted';
+        const t = (s.tasks || []).find(t => t.id === s.receiver.job.id);
+        if (t) t.status = 'interrupted';
+      }
     });
     channel.setSession({ token: initial.account.token, baseUrl: initial.account.base });
     channel.restoreContextToken(initial.account.userId, initial.account.contextToken);
@@ -231,7 +244,9 @@ export async function worker({
 
       // prompt / new task → codex exec (async: polling continues while it runs)
       if (active || taskPromise) {
-        return reply(`busy:${item.id}`, '⏳ 上一个任务还在运行,请等待完成,或先发送"停止"。');
+        const cur = state.receiver?.job;
+        const label = cur?.no ? `#${cur.no} ${cur.name}` : '';
+        return reply(`busy:${item.id}`, `⏳ 任务 ${label || '上一个'} 还在运行,请等待完成,或先发送"停止"。`);
       }
       let prompt = String(cmd.prompt || '').trim();
       if (!prompt && item.media?.length) prompt = mediaPrompt(item);
@@ -247,11 +262,19 @@ export async function worker({
       const resultPath = path.join(resultsDir, `${jobId}.md`);
       const savedThread = cmd.type === 'new' ? undefined : state.receiver?.threadId;
 
+      // Allocate the human identity: sequential number + short name from the prompt.
+      let taskNo = 0; let taskTitle = '';
       await store.update(s => {
         s.receiver ||= {};
-        s.receiver.job = { id: jobId, status: 'running', startedAt: Date.now(), prompt: prompt.slice(0, 200) };
+        s.receiver.taskSeq = (s.receiver.taskSeq || 0) + 1;
+        taskNo = s.receiver.taskSeq;
+        taskTitle = taskName(prompt);
+        s.receiver.job = { no: taskNo, name: taskTitle, id: jobId, status: 'running', startedAt: Date.now(), prompt: prompt.slice(0, 200) };
+        s.tasks ||= [];
+        s.tasks.push({ no: taskNo, name: taskTitle, id: jobId, status: 'running', startedAt: Date.now() });
+        s.tasks = s.tasks.slice(-20);
       }).catch(() => {});
-      await reply(`start:${jobId}`, `🚀 已开始执行任务\n\n${prompt.slice(0, 180)}`);
+      await reply(`start:${jobId}`, `🚀 任务 #${taskNo} 已开始:${taskTitle}\n\n${prompt.slice(0, 180)}`);
 
       const executable = await findCodex();
       active = codexRunner({
@@ -267,16 +290,23 @@ export async function worker({
         .then(async result => {
           await store.update(s => {
             s.receiver ||= {};
-            s.receiver.job = { id: jobId, status: result.status, finishedAt: Date.now(), threadId: result.threadId };
+            s.receiver.job = { no: taskNo, name: taskTitle, id: jobId, status: result.status, finishedAt: Date.now(), threadId: result.threadId };
             if (result.threadId) s.receiver.threadId = result.threadId;
+            const t = (s.tasks || []).find(t => t.id === jobId);
+            if (t) { t.status = result.status; t.finishedAt = Date.now(); if (result.threadId) t.threadId = result.threadId; }
           }).catch(() => {});
-          const { title, message } = resultMessage(result);
+          const { title, message } = resultMessage(result, taskNo, taskTitle);
           await enqueue(store, { notification_id: `result:${jobId}`, title, message, format: 'markdown' }).catch(() => {});
         })
         .catch(async e => {
           const err = publicError(e);
-          await store.update(s => { s.receiver ||= {}; s.receiver.job = { id: jobId, status: 'failed', finishedAt: Date.now() }; }).catch(() => {});
-          await enqueue(store, { notification_id: `result:${jobId}`, title: '❌ Codex 任务失败', message: err.message, format: 'text' }).catch(() => {});
+          await store.update(s => {
+            s.receiver ||= {};
+            s.receiver.job = { no: taskNo, name: taskTitle, id: jobId, status: 'failed', finishedAt: Date.now() };
+            const t = (s.tasks || []).find(t => t.id === jobId);
+            if (t) { t.status = 'failed'; t.finishedAt = Date.now(); }
+          }).catch(() => {});
+          await enqueue(store, { notification_id: `result:${jobId}`, title: `❌ Codex 任务失败 · #${taskNo} ${taskTitle}`, message: err.message, format: 'text' }).catch(() => {});
         })
         .finally(() => { if (active === mine) { active = null; taskPromise = null; } });
     }
