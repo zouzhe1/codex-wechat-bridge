@@ -55,6 +55,15 @@ export function markBlocked(state, now = Date.now()) {
 }
 
 /**
+ * A successful getupdates response proves the bot_token is still valid — clear any
+ * authExpired flag a transient 401/403 may have left behind. Without this, one
+ * flaky request permanently bricks the session with "请重新扫码".
+ */
+export function clearAuthFlag(state) {
+  if (state.account?.authExpired) state.account.authExpired = false;
+}
+
+/**
  * Inbound message ingestion: refreshes the window (context_token / lastInboundAt),
  * dedups, and returns fresh executable inbox items.
  *

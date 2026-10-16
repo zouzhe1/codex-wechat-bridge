@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { Store, LocalError, publicError } from './store.mjs';
+import { Store, LocalError, isAlive, publicError } from './store.mjs';
 import { Channel, classify } from './channel.mjs';
 import { publicStatus, receiverRunning } from './session.mjs';
 import { enqueue } from './outbox.mjs';
@@ -161,6 +161,30 @@ export function validateArgs(schema, args) {
 // control the bridge or send text (result delivery is the worker's job — no double-send).
 const CHILD_ALLOWED = new Set(['wechat_status', 'wechat_send_image', 'wechat_send_file']);
 
+/**
+ * Nurse: if the bridge died while the PC stayed on (the 2026-10-16 field incident —
+ * both worker and supervisor gone, phone messages met silence), revive it from any
+ * MCP touchpoint. Throttled to one spawn attempt per 30s; a live supervisor is left
+ * alone (it is the one whose job is respawn).
+ */
+export async function ensureBridgeAlive(store, { start = startWorker } = {}) {
+  if (process.env.WECHAT_BRIDGE_AUTOHEAL === '0') return { healed: false, why: 'disabled' };
+  if (process.env.WECHAT_BRIDGE_CHILD === '1') return { healed: false, why: 'child' };
+  try {
+    const s = await store.read();
+    if (receiverRunning(s)) return { healed: false, why: 'running' };
+    if (!s.account?.token || s.account.authExpired) return { healed: false, why: 'no_account' };
+    if (isAlive(s.supervisor?.pid)) return { healed: false, why: 'supervisor_alive' };
+    const now = Date.now();
+    if (s.settings?.lastHealAt && now - s.settings.lastHealAt < 30_000) return { healed: false, why: 'throttled' };
+    await store.update(st => { st.settings ||= {}; st.settings.lastHealAt = now; });
+    await start(store);
+    return { healed: true };
+  } catch (e) {
+    return { healed: false, why: e?.code || 'error' };
+  }
+}
+
 export async function callTool(name, rawArgs, { store = new Store(), channel = new Channel() } = {}) {
   if (process.env.WECHAT_BRIDGE_CHILD === '1' && !CHILD_ALLOWED.has(name)) {
     throw new LocalError('CHILD_CONTROL_DISABLED', '微信任务子进程不能控制桥接服务或重复发送文本。');
@@ -171,12 +195,16 @@ export async function callTool(name, rawArgs, { store = new Store(), channel = n
 
   switch (name) {
     case 'wechat_status': {
+      void ensureBridgeAlive(store).catch(() => {});
       const s = await store.read();
-      return { ...publicStatus(s), job: s.receiver?.job, messages_saved: (s.messages || []).length };
+      return { ...publicStatus(s), job: s.receiver?.job, messages_saved: (s.messages || []).length,
+        ...(s.receiver?.queueReason ? { queue_reason: s.receiver.queueReason } : {}) };
     }
     case 'wechat_send_message':
+      void ensureBridgeAlive(store).catch(() => {});
       return enqueue(store, { notification_id: args.id || `tool:${randomUUID()}`, message: args.text, format: 'text' });
     case 'wechat_send_markdown':
+      void ensureBridgeAlive(store).catch(() => {});
       return enqueue(store, { notification_id: args.id || `tool:${randomUUID()}`, message: args.markdown, title: args.title || '', format: 'markdown' });
     case 'wechat_send_image':
     case 'wechat_send_file': {

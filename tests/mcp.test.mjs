@@ -4,14 +4,14 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Store } from '../scripts/store.mjs';
-import { validateArgs, callTool as callToolDirect } from '../scripts/mcp-server.mjs';
+import { validateArgs, callTool as callToolDirect, ensureBridgeAlive } from '../scripts/mcp-server.mjs';
 import { tempDir, cleanup } from './helpers.mjs';
 
 const SERVER = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'mcp-server.mjs');
 
 function connect(stateDir, env = {}) {
   const child = spawn(process.execPath, [SERVER], {
-    env: { ...process.env, WECHAT_BRIDGE_STATE_DIR: stateDir, ...env },
+    env: { ...process.env, WECHAT_BRIDGE_STATE_DIR: stateDir, WECHAT_BRIDGE_AUTOHEAL: '0', ...env },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   const pending = new Map();
@@ -202,6 +202,50 @@ test('wechat_typing (in-process) uses the account session and reports soft failu
   const ok = await callToolDirect('wechat_typing', {}, { store, channel });
   assert.equal(ok.sent, true);
   assert.equal(fetchImpl.calls.length, 2, 'getconfig + sendtyping(typed)');
+});
+
+test('ensureBridgeAlive revives a dead bridge exactly once per throttle window', async t => {
+  const dir = await tempDir(); t.after(() => cleanup(dir));
+  const store = new Store(dir);
+  await store.update(s => {
+    s.account = { token: 'tok', base: 'https://ilinkai.weixin.qq.com', userId: 'u1', botId: 'b1' };
+    s.receiver = { enabled: false };
+  });
+  let starts = 0;
+  const start = async () => { starts += 1; };
+
+  const r1 = await ensureBridgeAlive(store, { start });
+  assert.equal(r1.healed, true);
+  assert.equal(starts, 1, 'dead bridge with no supervisor → start');
+
+  const r2 = await ensureBridgeAlive(store, { start });
+  assert.equal(r2.healed, false);
+  assert.equal(r2.why, 'throttled', 'second call within 30s is throttled');
+  assert.equal(starts, 1);
+
+  // a live supervisor means it is NOT our job to spawn
+  const dir2 = await tempDir(); t.after(() => cleanup(dir2));
+  const store2 = new Store(dir2);
+  await store2.update(s => {
+    s.account = { token: 'tok' };
+    s.supervisor = { pid: process.pid, stop: false };
+  });
+  const r3 = await ensureBridgeAlive(store2, { start });
+  assert.equal(r3.why, 'supervisor_alive');
+  assert.equal(starts, 1);
+
+  // no account → never spawn
+  const dir3 = await tempDir(); t.after(() => cleanup(dir3));
+  const r4 = await ensureBridgeAlive(new Store(dir3), { start });
+  assert.equal(r4.why, 'no_account');
+  assert.equal(starts, 1);
+
+  // env kill-switch
+  process.env.WECHAT_BRIDGE_AUTOHEAL = '0';
+  try {
+    const r5 = await ensureBridgeAlive(store, { start });
+    assert.equal(r5.why, 'disabled');
+  } finally { delete process.env.WECHAT_BRIDGE_AUTOHEAL; }
 });
 
 test('validateArgs applies defaults and enforces ranges', () => {

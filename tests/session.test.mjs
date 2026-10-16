@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readiness, ingest, publicStatus, markBlocked, receiverRunning,
+import { readiness, ingest, publicStatus, markBlocked, clearAuthFlag, receiverRunning,
   WINDOW_MS, BLOCK_MS, FRESH_MS } from '../scripts/session.mjs';
 
 const NOW = 1_700_000_000_000;
@@ -35,6 +35,16 @@ test('markBlocked applies a 60-minute -14 cooldown', () => {
   assert.equal(state.account.blockedUntil, NOW + BLOCK_MS);
   assert.equal(readiness(state.account, NOW), 'blocked');
   assert.equal(readiness(state.account, NOW + BLOCK_MS), 'ready', 'cooldown lifts itself');
+});
+
+test('clearAuthFlag heals a false "re-login required" left by a transient 401/403', () => {
+  const state = { account: account({ authExpired: true }) };
+  assert.equal(readiness(state.account, NOW), 'login_required');
+  clearAuthFlag(state);
+  assert.equal(state.account.authExpired, false);
+  assert.equal(readiness(state.account, NOW), 'ready', 'a valid poll proves the token is fine');
+  clearAuthFlag(state); // idempotent no-op when unset
+  assert.equal(state.account.authExpired, false);
 });
 
 function stateWith(accountOverrides = {}) {

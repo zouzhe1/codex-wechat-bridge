@@ -36,7 +36,23 @@ export class Store {
     const tmp = path.join(this.directory, `.state-${randomUUID()}.tmp`);
     try {
       await fs.writeFile(tmp, JSON.stringify(state), { mode: 0o600, flag: 'wx' });
-      await fs.rename(tmp, this.file);
+      // Windows: renaming onto state.json fails with EPERM while another process
+      // (AV scanner, indexer, one of our own readers) holds the target open.
+      // Retry briefly, then fall back to an in-place write — losing the update
+      // (and with it the fresh context_token) is worse than a non-atomic write.
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await fs.rename(tmp, this.file);
+          break;
+        } catch (e) {
+          if (e.code !== 'EPERM' && e.code !== 'EACCES') throw e;
+          if (attempt >= 7) {
+            await fs.writeFile(this.file, JSON.stringify(state), { mode: 0o600, flag: 'w' });
+            break;
+          }
+          await new Promise(resolve => setTimeout(resolve, 60));
+        }
+      }
     } finally { await fs.rm(tmp, { force: true }); }
   }
   async lock(name = 'state', waitMs = 3000) {

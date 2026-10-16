@@ -14,7 +14,7 @@
  */
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { Store } from './store.mjs';
+import { Store, isAlive } from './store.mjs';
 import { receiverRunning } from './session.mjs';
 import { enqueue } from './outbox.mjs';
 import { startWorker } from './worker.mjs';
@@ -45,6 +45,22 @@ async function main() {
   try { payload = JSON.parse(raw); } catch { return; }
   if (payload?.type !== 'agent-turn-complete') return;
   if (process.env.WECHAT_BRIDGE_CHILD === '1') return;
+
+  // Nurse first — BEFORE the notify-mode gate. A dead bridge stays dead until
+  // something revives it (2026-10-16: worker+supervisor died mid-day and phone
+  // messages met hours of silence). Every Codex turn-end is a revive chance.
+  if (process.env.WECHAT_BRIDGE_AUTOHEAL !== '0') {
+    try {
+      const s = await store.read();
+      if (!receiverRunning(s) && s.account?.token && !s.account.authExpired && !isAlive(s.supervisor?.pid)) {
+        const now = Date.now();
+        if (!s.settings?.lastHealAt || now - s.settings.lastHealAt > 30_000) {
+          await store.update(st => { st.settings ||= {}; st.settings.lastHealAt = now; });
+          await startWorker(store);
+        }
+      }
+    } catch { /* best effort */ }
+  }
 
   const state = await store.read().catch(() => null);
   if (!state) return;

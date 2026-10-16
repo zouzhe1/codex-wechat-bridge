@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 /**
- * Worker watchdog. Spawned detached by startWorker() and by the logon scheduled
- * task (install.ps1). Keeps one worker alive across crashes and hard hangs
+ * Worker watchdog. Spawned detached by startWorker() and by the logon autostart
+ * (install.ps1 → VBS). Keeps one worker alive across crashes and hard hangs
  * (heartbeat staleness), with 2s→60s respawn backoff.
  *
  * Exit conditions (all intentional):
  *   - no bound account (exit 3) — nothing to supervise
  *   - stop requested via state (stopWorker) — bridge was turned off
  *   - another supervisor already holds the lock (exit 0)
+ *
+ * Everything it logs is mirrored into <state>/worker.log — the VBS autostart
+ * hides stderr, so the file is the only trace of why the worker died.
  */
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -19,8 +22,15 @@ const WORKER_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), 'w
 const HANG_MS = 120_000;          // worker alive but heartbeat older than this → kill + respawn
 const STARTUP_MS = 60_000;         // worker must take over state within this window
 const CHECK_MS = 30_000;
+const STALE_STRIKES = 2;           // consecutive stale checks before killing (wake-from-sleep tolerance)
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const log = (...a) => console.error(new Date().toISOString(), '[supervisor]', ...a);
+
+let logPath = null;
+function log(...a) {
+  const line = `${new Date().toISOString()} [supervisor] ${a.join(' ')}\n`;
+  console.error(line.trim());
+  if (logPath) fs.appendFile(logPath, line).catch(() => {});
+}
 
 async function stopRequested(store) {
   try { const s = await store.read(); return !!s.supervisor?.stop; } catch { return false; }
@@ -41,6 +51,18 @@ export async function supervisor({
     throw e;
   }
 
+  logPath = path.join(store.directory, 'worker.log');
+  log(`supervisor started pid=${process.pid}`);
+
+  // A dying supervisor means nobody revives the worker until the next logon —
+  // never exit silently on a stray rejection.
+  process.on('unhandledRejection', reason => {
+    log('unhandledRejection:', reason?.code || reason?.message || String(reason));
+  });
+  process.on('uncaughtException', e => {
+    log('uncaughtException:', publicError(e).code, e?.message);
+  });
+
   const pid = process.pid;
   // Fresh intent: clear any stale stop flag from a previous stop command.
   await store.update(s => { s.supervisor = { pid, stop: false, startedAt: Date.now() }; }).catch(() => {});
@@ -58,7 +80,7 @@ export async function supervisor({
 
       let logFd = null;
       await store.ensure().catch(() => {});
-      try { logFd = await fs.open(path.join(store.directory, 'worker.log'), 'a', 0o600); } catch { /* ignore */ }
+      try { logFd = await fs.open(logPath, 'a', 0o600); } catch { /* ignore */ }
       const errFd = logFd ? logFd.fd : 'ignore';
       const child = spawn(process.execPath, [workerScript, '--worker'], {
         stdio: ['ignore', 'ignore', errFd], windowsHide: true,
@@ -74,6 +96,9 @@ export async function supervisor({
         child.once('error', () => done(-1));
         child.once('exit', code => done(code));
 
+        // hang detection with wake-from-sleep tolerance: only kill after
+        // STALE_STRIKES consecutive stale checks
+        let staleStrikes = 0;
         const watch = setInterval(() => {
           if (settled) return;
           store.read().then(s => {
@@ -83,8 +108,13 @@ export async function supervisor({
             const age = hb > 0 ? Date.now() - hb : Date.now() - spawnedAt;
             const limit = hb > 0 ? hangMs : startupMs;
             if (age > limit) {
-              log(`worker pid=${child.pid} hung (heartbeat age ${Math.round(age / 1000)}s) — killing`);
-              try { child.kill('SIGKILL'); } catch { /* already gone */ }
+              staleStrikes += 1;
+              if (staleStrikes >= STALE_STRIKES) {
+                log(`worker pid=${child.pid} hung (heartbeat age ${Math.round(age / 1000)}s, ${staleStrikes} strikes) — killing`);
+                try { child.kill('SIGKILL'); } catch { /* already gone */ }
+              }
+            } else {
+              staleStrikes = 0;
             }
           }).catch(() => {});
         }, checkMs);
@@ -99,6 +129,7 @@ export async function supervisor({
       backoff = Math.min(backoff * 2, 60_000);
     }
   } finally {
+    log('supervisor exiting');
     await store.update(s => {
       if (s.supervisor?.pid === pid) s.supervisor = { pid: null, stop: false };
     }).catch(() => {});

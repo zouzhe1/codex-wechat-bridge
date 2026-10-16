@@ -22,6 +22,15 @@ description: 微信(iLink 官方协议)桥接。当用户说"通过微信告诉�
 - 返回 `message_required` = 24h 窗口关闭,消息已排队;桌面会提醒用户"发一条消息解锁"。**不要把排队当失败反复重试**。
 - 返回 `status: unknown` 表示超时且可能已送达——**绝不换 id 重发**(宁缺勿重复)。
 
+## 排障规则(重要,2026-10-16 实战教训)
+
+1. **用户说"没收到/没反应"时,第一步永远是 `wechat_status`**,按 `connection` 与 `queue_reason` 判断:
+   - `queue_reason` 提到"额度/解锁" → 让用户**在微信里给 ClawBot 随便回一条消息**(任何内容),队列 60 秒内自动补发;**绝不需要重新扫码**。
+   - `connection: login_required` → 才考虑重新扫码。
+2. 微信服务器有**每窗口发送额度**(实测连续发十余条后返回错误码 -2),超了消息会排队并等用户下次开口。这不是 bug,提醒用户回一条消息即可。
+3. 排队消息只保留 **2 小时新鲜度**,更早的自动过期丢弃(避免旧消息轰炸);用户问起要如实说明。
+4. 桥接进程有三级自愈:supervisor 看门狗 → notify 钩子 → MCP 工具调用。若 `wechat_status` 显示 `receiver: stopped` 且多次调用仍不恢复,才用 `wechat_start` 手动拉起。
+
 ## 子进程限制(WECHAT_BRIDGE_CHILD=1)
 
 从微信发起的任务运行在受限模式:只有 `wechat_status` / `wechat_send_image` / `wechat_send_file` 可用,文本发送与桥接控制返回 `CHILD_CONTROL_DISABLED`。这是故意的——结果由 worker 自动回传,重复调用会双发。遇到该错误不要重试、不要换工具绕过。

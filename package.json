@@ -1,6 +1,6 @@
 {
   "name": "codex-wechat-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Codex <-> WeChat bridge plugin over the official iLink protocol (OpeniLink SDK as protocol layer)",

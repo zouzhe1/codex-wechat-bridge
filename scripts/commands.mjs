@@ -23,6 +23,14 @@ export function parseCommand(value) {
   return { type: 'prompt', prompt: text };
 }
 
+const ERROR_HINTS = {
+  API_REJECTED: '服务器拒绝发送(多为窗口发送额度用完): 在微信里给 ClawBot 回一条消息即可解锁队列',
+  AUTH_EXPIRED: '登录凭据失效,需要重新扫码绑定',
+  RATE_LIMITED: '被微信限流,稍后自动重试',
+  SESSION_EXPIRED: '会话过期冷却中(约 1 小时),发一条消息可提前恢复',
+  NETWORK_ERROR: '网络波动,自动重试中',
+};
+
 export function statusText(state) {
   const s = publicStatus(state);
   const lines = [
@@ -32,7 +40,9 @@ export function statusText(state) {
     `待发消息: ${s.pending_messages} 条入站 / ${s.pending_notifications} 条出站`,
   ];
   if (s.blocked_until) lines.push(`风控冷却至: ${s.blocked_until}`);
-  if (s.last_error) lines.push(`最近错误: ${s.last_error}`);
+  const hint = state.receiver?.queueReason || ERROR_HINTS[state.receiver?.lastError];
+  if (hint) lines.push(`提示: ${hint}`);
+  else if (s.last_error) lines.push(`最近错误: ${s.last_error}`);
   return lines.join('\n');
 }
 

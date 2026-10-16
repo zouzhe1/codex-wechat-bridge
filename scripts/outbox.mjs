@@ -5,15 +5,19 @@ import { classify } from './channel.mjs';
 import { mdToText } from './format.mjs';
 import { chunk } from './chunker.mjs';
 
-// Queued notifications survive window expiry for 7 days (the old plugin's proven TTL);
-// history keeps hashes only — never bodies — for 30 days.
+// Queued notifications survive window expiry for 7 days at the queue level, but a
+// notification older than QUEUE_FRESH_MS is auto-expired instead of delivered —
+// a day-old "task finished" burst is noise, not value (real-world lesson 2026-10-16).
 export const OUTBOX_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+export const QUEUE_FRESH_MS = 2 * 60 * 60 * 1000;
 const HISTORY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const HISTORY_MAX = 1000;
 const OUTBOX_MAX = 50;
 const MAX_TITLE = 80;
 const MAX_BODY = 50_000;      // after chunking this is ~28 messages — plenty for a run summary
 const UNCERTAIN_MAX_ATTEMPTS = 3;
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 const sha = t => createHash('sha256').update(t).digest('hex');
 
@@ -89,25 +93,54 @@ async function markHistory(store, notificationId, patch) {
 }
 
 // Drain the outbox while the window is open.
-// Three-bucket error policy:
-//   server-said-later (SESSION_*, RATE_LIMITED, HTTP_ERROR, AUTH_EXPIRED) → keep queued;
-//   uncertain (TIMEOUT, NETWORK, INVALID_RESPONSE) → retry up to 3 attempts, then mark
-//     unknown+drop (never re-send under the same id after that — duplicates are worse
-//     than a gap);
-//   certain rejection (API_REJECTED, UNTRUSTED, …) → mark rejected+drop.
-export async function flushOutbox(store, channel, { now = Date.now() } = {}) {
+// Error policy (hardened after the 2026-10-16 field incident, where the server
+// answered ret=-2 — a per-window send quota — and the old code dropped 20
+// notifications as "certain rejections"):
+//   SESSION_*, RATE_LIMITED, HTTP_ERROR, AUTH_EXPIRED → keep queued;
+//   API_REJECTED (observed as ret=-2 when the per-window send quota is spent)
+//     → KEEP queued and stop the cycle — the next inbound WeChat message re-opens
+//     the quota and the flush retries automatically;
+//   uncertain (TIMEOUT, NETWORK, INVALID_RESPONSE) → retry up to 3 attempts, then
+//     mark unknown+drop (never re-send under the same id — duplicates are worse
+//     than a gap).
+// Freshness: items older than freshMs are expired, never delivered. Pacing: a
+// configurable delay between sends and a per-cycle budget keep bursts off the
+// server's anti-spam radar.
+export async function flushOutbox(store, channel, {
+  now = Date.now(),
+  pacingMs = 1_500,
+  maxPerCycle = 8,
+  freshMs = QUEUE_FRESH_MS,
+} = {}) {
   const KEEP = new Set(['SESSION_REQUIRED', 'SESSION_EXPIRED', 'RATE_LIMITED', 'HTTP_ERROR', 'AUTH_EXPIRED', 'BUSY']);
   const first = await store.read();
   const connection = readiness(first.account, now);
-  if (connection !== 'ready') return { flushed: 0, connection, remaining: (first.outbox || []).length };
+  if (connection !== 'ready') {
+    await noteQueueReason(store, reasonFor(connection));
+    return { flushed: 0, connection, remaining: (first.outbox || []).length };
+  }
 
   let flushed = 0;
+  let sentThisCycle = 0;
   for (;;) {
     const snap = await store.read();
-    if (readiness(snap.account, Date.now()) !== 'ready') return { flushed, connection: 'not_ready', remaining: (snap.outbox || []).length };
-    snap.outbox = (snap.outbox || []).filter(o => Date.now() - o.createdAt < OUTBOX_TTL_MS);
+    if (readiness(snap.account, Date.now()) !== 'ready') {
+      return { flushed, connection: 'not_ready', remaining: (snap.outbox || []).length };
+    }
+    // expire stale notifications instead of dumping them on the user later
+    const stale = (snap.outbox || []).filter(o => Date.now() - o.createdAt >= freshMs);
+    if (stale.length) {
+      await store.update(state => {
+        state.outbox = (state.outbox || []).filter(o => Date.now() - o.createdAt < freshMs);
+      });
+      for (const o of stale) await markHistory(store, o.notification_id, { status: 'expired', updatedAt: Date.now() });
+      continue;
+    }
     const item = snap.outbox[0];
     if (!item) return { flushed, connection: 'ready', remaining: 0 };
+    if (sentThisCycle >= maxPerCycle) {
+      return { flushed, connection: 'ready', remaining: (snap.outbox || []).length, budget_exhausted: true };
+    }
 
     try {
       const chunks = compose(item);
@@ -124,6 +157,8 @@ export async function flushOutbox(store, channel, { now = Date.now() } = {}) {
       });
       await markHistory(store, item.notification_id, { status: 'accepted', updatedAt: Date.now() });
       flushed += 1;
+      sentThisCycle += 1;
+      if (pacingMs > 0) await sleep(pacingMs);
       continue;
     } catch (e) {
       const err = classify(e);
@@ -131,10 +166,23 @@ export async function flushOutbox(store, channel, { now = Date.now() } = {}) {
 
       if (err.code === 'AUTH_EXPIRED') {
         await store.update(state => { if (state.account) state.account.authExpired = true; }).catch(() => {});
+        await noteQueueReason(store, '微信登录凭据失效,需要重新扫码绑定');
         return { flushed, connection: 'login_required', remaining: (await store.read()).outbox.length, error: err.code };
       }
       if (KEEP.has(err.code)) {
+        await noteQueueReason(store, reasonFor(connectionOf(err)));
         return { flushed, connection: connectionOf(err), remaining: (await store.read()).outbox.length, error: err.code };
+      }
+      if (err.code === 'API_REJECTED') {
+        // Server said no (field-observed as ret=-2: per-window send quota spent).
+        // KEEP the item — the quota re-opens when the user sends any WeChat message.
+        await store.update(state => {
+          const it = (state.outbox || []).find(o => o.notification_id === item.notification_id && o.createdAt === item.createdAt);
+          if (it) it.attempts = (it.attempts || 0) + 1;
+          state.receiver ||= {};
+          state.receiver.queueReason = '微信窗口发送额度已用完: 在微信里给 ClawBot 回一条消息即可解锁队列';
+        }).catch(() => {});
+        return { flushed, connection: 'rate_limited', remaining: (await store.read()).outbox.length, error: `API_REJECTED(${err.remoteCode ?? '?'})` };
       }
       if (err.uncertain === true) {
         const attempts = (item.attempts || 0) + 1;
@@ -152,14 +200,28 @@ export async function flushOutbox(store, channel, { now = Date.now() } = {}) {
         await markHistory(store, item.notification_id, { status: 'unknown', updatedAt: Date.now() });
         return { flushed, connection: 'ready', remaining: (await store.read()).outbox.length, error: err.code };
       }
-      // certain rejection: drop so the queue cannot jam
-      await store.update(state => {
-        state.outbox = (state.outbox || []).filter(
-          o => !(o.notification_id === item.notification_id && o.createdAt === item.createdAt));
-      });
-      await markHistory(store, item.notification_id, { status: 'rejected', updatedAt: Date.now(), remoteCode: err.remoteCode ?? null });
-      continue;
+      // unknown certain rejection (LOCAL_FAILURE etc.): keep queued, stop the cycle
+      await noteQueueReason(store, `发送失败(${err.code}),稍后自动重试`);
+      return { flushed, connection: 'ready', remaining: (await store.read()).outbox.length, error: err.code };
     }
+  }
+}
+
+async function noteQueueReason(store, reason) {
+  await store.update(state => {
+    state.receiver ||= {};
+    state.receiver.queueReason = reason;
+  }).catch(() => {});
+}
+
+function reasonFor(connection) {
+  switch (connection) {
+    case 'message_required':
+    case 'token_expired': return '微信 24h 窗口未开启: 在微信里给 ClawBot 发一条消息即可解锁队列';
+    case 'blocked': return '风控冷却中(约 1 小时后自动恢复)';
+    case 'rate_limited': return '微信窗口发送额度已用完: 在微信里给 ClawBot 回一条消息即可解锁队列';
+    case 'login_required': return '微信未绑定或凭据失效,需要重新扫码';
+    default: return null;
   }
 }
 

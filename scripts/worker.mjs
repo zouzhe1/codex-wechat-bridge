@@ -6,7 +6,7 @@ import fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { Store, LocalError, isAlive, publicError } from './store.mjs';
 import { Channel, classify } from './channel.mjs';
-import { ingest, readiness, markBlocked, receiverRunning, FRESH_MS } from './session.mjs';
+import { ingest, readiness, markBlocked, clearAuthFlag, receiverRunning, FRESH_MS } from './session.mjs';
 import { parseCommand, HELP, statusText, PENDING_TASK_REPLY } from './commands.mjs';
 import { enqueue, flushOutbox } from './outbox.mjs';
 import { findCodex, runCodex } from './codex.mjs';
@@ -15,7 +15,7 @@ import { toast } from './toast.mjs';
 
 const HEARTBEAT_MS = 10_000;
 const EXIT_GRACE_MS = 8_000;
-const TOAST_COOLDOWN_MS = 30 * 60_000;
+const TOAST_COOLDOWN_MS = 10 * 60_000;
 const HISTORY_KEEP = 20;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const log = (...args) => console.error(new Date().toISOString(), ...args);
@@ -54,6 +54,19 @@ export function makeLocalRunner(store) {
       default: return reply(`reply:${item.id}`, PENDING_TASK_REPLY);
     }
   };
+}
+
+/** Toast (throttled) telling the user exactly how to unlock a stuck queue. */
+async function queueToastNotice(store, pending) {
+  const s = await store.read();
+  const lastToast = Math.max(s.account?.queueToastAt || 0, s.receiver?.queueToastAt || 0);
+  if (Date.now() - lastToast < TOAST_COOLDOWN_MS) return;
+  const reason = s.receiver?.queueReason || '微信窗口未开启或发送受限';
+  toast('微信 · 消息待发', `${pending} 条消息排队中。${reason}。`);
+  await store.update(st => {
+    if (st.account) st.account.queueToastAt = Date.now();
+    if (st.receiver) st.receiver.queueToastAt = Date.now();
+  }).catch(() => {});
 }
 
 function resultMessage(result) {
@@ -95,6 +108,15 @@ export async function worker({
   process.on('SIGTERM', onSignal);
   process.on('SIGINT', onSignal);
   if (stopSignal) Promise.resolve(stopSignal).then(() => onSignal()).catch(() => {});
+  // Crash-proofing: an unhandled rejection must not silently kill the bridge;
+  // a hard crash exits non-zero so the supervisor respawns us.
+  process.on('unhandledRejection', reason => {
+    log('unhandledRejection:', reason?.code || reason?.message || String(reason));
+  });
+  process.on('uncaughtException', e => {
+    log('uncaughtException:', publicError(e).code, e?.message);
+    process.exit(1);
+  });
 
   let active = null;       // { child, stop, done } of the running codex exec
   let taskPromise = null;
@@ -153,6 +175,12 @@ export async function worker({
         {
           initial_buf: account.cursor || '',
           on_buf_update: buf => { store.update(s => { if (s.account) s.account.cursor = buf; }).catch(() => {}); },
+          on_response: () => {
+            // a successful poll proves the token is valid → heal a false "re-login required"
+            store.read().then(s => {
+              if (s.account?.authExpired) store.update(clearAuthFlag).catch(() => {});
+            }).catch(() => {});
+          },
           on_error: err => { log('monitor:', err?.message); },
           on_session_expired: () => { log('session expired (-14): cooling down 60 min'); store.update(s => markBlocked(s)).catch(() => {}); },
           should_continue: () => !exiting,
@@ -253,23 +281,23 @@ export async function worker({
         .finally(() => { if (active === mine) { active = null; taskPromise = null; } });
     }
 
-    // ③ Outbox flush — drains whenever the window is open; toasts when it is not.
+    // ③ Outbox flush — drains whenever the window is open; toasts on ANY blocker so
+    // the user never stares at silence (field lesson 2026-10-16).
     const flushFn = async () => {
       while (!exiting) {
         let waitMs = 5_000;
         try {
           const r = await flushOutbox(store, channel);
           const pending = r.remaining ?? 0;
-          if (pending > 0 && ['message_required', 'token_expired', 'blocked'].includes(r.connection)) {
-            waitMs = 60_000;
-            const s = await store.read();
-            const lastToast = s.account?.queueToastAt || 0;
-            if (Date.now() - lastToast > TOAST_COOLDOWN_MS) {
-              toast('微信 · 消息待发', `${pending} 条消息在排队。给微信 ClawBot 发一条消息即可解锁发送。`);
-              await store.update(st => { if (st.account) st.account.queueToastAt = Date.now(); }).catch(() => {});
+          if (pending > 0) {
+            if (r.connection === 'ready') {
+              waitMs = r.budget_exhausted ? 60_000 : 1_000;
+            } else {
+              // window closed / rate-limited / blocked / login required → back off
+              // hard and tell the user exactly how to unlock
+              waitMs = 60_000;
+              await queueToastNotice(store, pending);
             }
-          } else if (pending > 0) {
-            waitMs = 1_000;
           }
         } catch (e) {
           log('flush error:', publicError(e).code, e?.message);

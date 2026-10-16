@@ -109,7 +109,7 @@ test('flush: ready window drains items and marks history accepted', async t => {
   await enqueue(store, { notification_id: 'n1', title: 'T1', message: '内容一' });
   await enqueue(store, { notification_id: 'n2', message: '内容二' });
   const channel = mockChannel();
-  const r = await flushOutbox(store, channel);
+  const r = await flushOutbox(store, channel, { pacingMs: 0 });
   assert.equal(r.flushed, 2);
   assert.equal(channel.sent.length, 2);
   assert.equal(channel.sent[0].to, 'u1');
@@ -125,7 +125,7 @@ test('flush: markdown bodies are converted then split into protocol-sized chunks
   const longMd = Array.from({ length: 40 }, (_, i) => `## 小节 ${i}\n\n${'内容句子。'.repeat(60)}`).join('\n\n');
   await enqueue(store, { notification_id: 'n1', message: longMd, format: 'markdown' });
   const channel = mockChannel();
-  const r = await flushOutbox(store, channel);
+  const r = await flushOutbox(store, channel, { pacingMs: 0 });
   assert.ok(r.flushed === 1);
   assert.ok(channel.sent.length > 1, 'long content must split into multiple messages');
   for (const s of channel.sent) {
@@ -165,20 +165,50 @@ test('flush: uncertain failures retry up to 3 attempts then mark unknown and dro
   assert.equal(s.notifications[0].status, 'unknown', 'never retried under the same id again');
 });
 
-test('flush: certain rejection drops the item but keeps the queue moving', async t => {
+test('flush: server quota rejection (API_REJECTED/-2) KEEPS the item and reports how to unlock', async t => {
   const store = await seededStore(t);
-  await enqueue(store, { notification_id: 'bad', message: 'nope' });
-  await enqueue(store, { notification_id: 'good', message: 'yes' });
-  let calls = 0;
-  const channel = mockChannel({ fail: () => {
-    calls += 1;
-    return calls === 1 ? new ChannelError('API_REJECTED', 'x', { remoteCode: -99, uncertain: false }) : null;
-  } });
-  const r = await flushOutbox(store, channel);
-  assert.equal(r.flushed, 1, 'the good item must still go out');
+  await enqueue(store, { notification_id: 'n1', message: 'will be refused by quota' });
+  const channel = mockChannel({ fail: () => new ChannelError('API_REJECTED', 'x', { remoteCode: -2, uncertain: false }) });
+  const r = await flushOutbox(store, channel, { pacingMs: 0 });
+  assert.equal(r.flushed, 0);
+  assert.equal(r.connection, 'rate_limited', 'quota refusal must read as rate_limited, not drop');
+  const s = await store.read();
+  assert.equal(s.outbox.length, 1, 'the item must survive — quota re-opens on the next user message');
+  assert.equal(s.outbox[0].attempts, 1);
+  assert.match(s.receiver.queueReason, /额度/);
+  assert.equal(s.notifications[0].status, 'queued', 'must NOT be marked rejected');
+});
+
+test('flush: stale notifications expire instead of bursting on the user', async t => {
+  const dir = await tempDir(); t.after(() => cleanup(dir));
+  const store = new Store(dir);
+  await store.update(s => { s.account = readyAccount(); s.receiver = { enabled: false }; });
+  const h = 60 * 60_000;
+  await enqueue(store, { notification_id: 'old-1', message: 'yesterday news', now: Date.now() - 3 * h });
+  await enqueue(store, { notification_id: 'old-2', message: 'older news', now: Date.now() - 10 * h });
+  await enqueue(store, { notification_id: 'fresh', message: 'just finished', now: Date.now() - 60_000 });
+
+  const channel = mockChannel();
+  const r = await flushOutbox(store, channel, { pacingMs: 0 });
+  assert.equal(r.flushed, 1, 'only the fresh item is delivered');
+  assert.equal(channel.sent[0].text.includes('just finished'), true);
   const s = await store.read();
   assert.equal(s.outbox.length, 0);
-  assert.deepEqual(s.notifications.map(n => n.status).sort(), ['accepted', 'rejected']);
+  const expired = s.notifications.filter(n => n.status === 'expired');
+  assert.equal(expired.length, 2, 'stale items are marked expired, never delivered');
+});
+
+test('flush: per-cycle budget spreads bursts across cycles', async t => {
+  const store = await seededStore(t);
+  for (let i = 0; i < 3; i++) await enqueue(store, { notification_id: `n${i}`, message: `m${i}` });
+  const channel = mockChannel();
+  const r1 = await flushOutbox(store, channel, { pacingMs: 0, maxPerCycle: 2 });
+  assert.equal(r1.flushed, 2);
+  assert.equal(r1.budget_exhausted, true);
+  assert.equal(r1.remaining, 1);
+  const r2 = await flushOutbox(store, channel, { pacingMs: 0, maxPerCycle: 2 });
+  assert.equal(r2.flushed, 1);
+  assert.equal(r2.budget_exhausted, undefined);
 });
 
 test('flush: partial chunk progress resumes without resending earlier chunks', async t => {
