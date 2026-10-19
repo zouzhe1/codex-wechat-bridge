@@ -400,18 +400,24 @@ export async function startWorker(store = new Store()) {
   throw new LocalError('START_FAILED', '微信接收服务未能启动。');
 }
 
-/** Stop worker + supervisor via the stop flag, and kill the worker immediately. */
+/** Stop worker + supervisor, clear their state and locks — a deliberate stop must
+ * leave NO trace that a later start could misread (a killed supervisor's pid gets
+ * reused by Windows within seconds; its leftover heartbeat once fooled startWorker
+ * into thinking a supervisor was still running). */
 export async function stopWorker(store = new Store()) {
   const s = await store.read();
   await store.update(state => {
     if (state.receiver) state.receiver.enabled = false;
-    if (state.supervisor) state.supervisor.stop = true;
+    state.supervisor = { pid: null, stop: false };
   });
   if (receiverRunning(s)) {
     try { process.kill(s.receiver.pid, 'SIGTERM'); } catch { /* already gone */ }
   }
   if (isAlive(s.supervisor?.pid)) {
     try { process.kill(s.supervisor.pid, 'SIGTERM'); } catch { /* already gone */ }
+  }
+  for (const name of ['supervisor.lock', 'worker.lock']) {
+    await fs.rm(path.join(store.directory, name), { force: true }).catch(() => {});
   }
   return { status: receiverRunning(s) ? 'stopping' : 'stopped' };
 }

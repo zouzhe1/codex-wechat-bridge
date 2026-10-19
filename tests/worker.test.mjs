@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { Store } from '../scripts/store.mjs';
 import { Channel, ChannelError } from '../scripts/channel.mjs';
 import { worker, startWorker, stopWorker, makeLocalRunner, taskName, supervisorAlive } from '../scripts/worker.mjs';
@@ -37,6 +40,33 @@ test('stopWorker on an idle bridge reports stopped and marks the flag', async t 
   const r = await stopWorker(store);
   assert.equal(r.status, 'stopped');
   assert.equal((await store.read()).receiver.enabled, false);
+});
+
+test('stopWorker erases the supervisor entry and both lock files (no pid-reuse traps)', async t => {
+  const dir = await tempDir(); t.after(() => cleanup(dir));
+  const store = new Store(dir);
+  // a real live process stands in for the worker so stopWorker has something to
+  // signal — must NOT be our own pid, or the test would SIGTERM the test runner
+  const dummy = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
+  t.after(() => { try { dummy.kill('SIGKILL'); } catch { /* already gone */ } });
+  await new Promise(r => setTimeout(r, 300));
+
+  await store.update(s => {
+    s.account = { token: 't' };
+    s.receiver = { enabled: true, pid: dummy.pid, heartbeat: Date.now() };
+    s.supervisor = { pid: 999_999_99, stop: false, heartbeat: Date.now() };
+  });
+  await fs.writeFile(path.join(dir, 'supervisor.lock'), 'x');
+  await fs.writeFile(path.join(dir, 'worker.lock'), 'x');
+
+  const r = await stopWorker(store);
+  // Windows TerminateProcess is synchronous → 'stopped'; POSIX SIGTERM is async → 'stopping'
+  assert.ok(['stopping', 'stopped'].includes(r.status), 'receiver was running: ' + r.status);
+  const s = await store.read();
+  assert.deepEqual(s.supervisor, { pid: null, stop: false }, 'supervisor entry must be cleared, not left with a reusable pid');
+  assert.equal(s.receiver.enabled, false);
+  assert.equal(await fs.access(path.join(dir, 'supervisor.lock')).then(() => true, () => false), false);
+  assert.equal(await fs.access(path.join(dir, 'worker.lock')).then(() => true, () => false), false);
 });
 
 test('localRunner answers ping with PONG using the inbound message context_token', async t => {

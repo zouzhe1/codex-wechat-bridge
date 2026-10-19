@@ -1,6 +1,6 @@
 {
   "name": "wechat-bridge",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "WeChat (official iLink protocol) bridge for Codex: task-completion notifications, two-way messaging, Markdown rendering, images and files.",
   "author": { "name": "codex-wechat-bridge contributors" },
   "license": "MIT",
