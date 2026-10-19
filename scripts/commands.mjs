@@ -14,11 +14,11 @@ export const HELP = [
 export function parseCommand(value) {
   const text = String(value ?? '').trim();
   const lower = text.toLowerCase();
-  if (/^(帮助|\/help|help)$/.test(lower)) return { type: 'help' };
-  if (/^(进度|状态|\/status|status)$/.test(lower)) return { type: 'status' };
-  if (/^(停止|\/stop|stop)$/.test(lower)) return { type: 'stop' };
-  if (/^(连接测试|\/ping|ping)$/.test(lower)) return { type: 'ping' };
-  const newTask = text.match(/^(?:新任务|\/new)\s+([\s\S]+)$/i);
+  if (/^(帮助|\/帮助|\/help|help)$/.test(lower)) return { type: 'help' };
+  if (/^(进度|\/进度|状态|\/状态|\/status|status)$/.test(lower)) return { type: 'status' };
+  if (/^(停止|\/停止|\/stop|stop)$/.test(lower)) return { type: 'stop' };
+  if (/^(连接测试|\/连接测试|\/ping|ping)$/.test(lower)) return { type: 'ping' };
+  const newTask = text.match(/^(?:新任务|\/新任务|\/new)\s+([\s\S]+)$/i);
   if (newTask) return { type: 'new', prompt: newTask[1].trim() };
   return { type: 'prompt', prompt: text };
 }

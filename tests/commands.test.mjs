@@ -6,11 +6,16 @@ test('parseCommand recognises the local command table (case-insensitive)', () =>
   assert.deepEqual(parseCommand('帮助'), { type: 'help' });
   assert.deepEqual(parseCommand('/HELP'), { type: 'help' });
   assert.deepEqual(parseCommand('状态'), { type: 'status' });
+  assert.deepEqual(parseCommand('/状态'), { type: 'status' });
+  assert.deepEqual(parseCommand('/进度'), { type: 'status' });
   assert.deepEqual(parseCommand('/status'), { type: 'status' });
   assert.deepEqual(parseCommand('停止'), { type: 'stop' });
+  assert.deepEqual(parseCommand('/停止'), { type: 'stop' });
   assert.deepEqual(parseCommand('连接测试'), { type: 'ping' });
+  assert.deepEqual(parseCommand('/连接测试'), { type: 'ping' });
   assert.deepEqual(parseCommand('  ping  '), { type: 'ping' });
   assert.deepEqual(parseCommand('新任务 优化 README'), { type: 'new', prompt: '优化 README' });
+  assert.deepEqual(parseCommand('/新任务 优化 README'), { type: 'new', prompt: '优化 README' });
 });
 
 test('anything else becomes a task prompt — including shell-looking text', () => {

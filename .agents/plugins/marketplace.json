@@ -7,7 +7,7 @@
       "source": "./",
       "category": "Productivity",
       "description": "WeChat (official iLink protocol) bridge: task notifications, two-way chat, Markdown, images.",
-      "version": "0.1.3"
+      "version": "0.1.4"
     }
   ]
 }
