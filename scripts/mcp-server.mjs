@@ -174,7 +174,12 @@ export async function ensureBridgeAlive(store, { start = startWorker } = {}) {
     const s = await store.read();
     if (receiverRunning(s)) return { healed: false, why: 'running' };
     if (!s.account?.token || s.account.authExpired) return { healed: false, why: 'no_account' };
-    if (isAlive(s.supervisor?.pid)) return { healed: false, why: 'supervisor_alive' };
+    // bare isAlive() is not enough — a reused pid once masqueraded as our supervisor;
+    // heartbeat freshness is what distinguishes a live supervisor from a stranger
+    const hb = Number(s.supervisor?.heartbeat) || 0;
+    if (isAlive(s.supervisor?.pid) && hb > 0 && Date.now() - hb < 90_000) {
+      return { healed: false, why: 'supervisor_alive' };
+    }
     const now = Date.now();
     if (s.settings?.lastHealAt && now - s.settings.lastHealAt < 30_000) return { healed: false, why: 'throttled' };
     await store.update(st => { st.settings ||= {}; st.settings.lastHealAt = now; });

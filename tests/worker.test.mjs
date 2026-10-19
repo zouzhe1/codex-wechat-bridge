@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Store } from '../scripts/store.mjs';
 import { Channel, ChannelError } from '../scripts/channel.mjs';
-import { worker, startWorker, stopWorker, makeLocalRunner, taskName } from '../scripts/worker.mjs';
+import { worker, startWorker, stopWorker, makeLocalRunner, taskName, supervisorAlive } from '../scripts/worker.mjs';
 import { flushOutbox } from '../scripts/outbox.mjs';
 import { mockFetch, tempDir, cleanup } from './helpers.mjs';
 
@@ -99,6 +99,15 @@ test('taskName derives a short human label from the prompt', () => {
   assert.equal(taskName('x'.repeat(40)), 'x'.repeat(24) + '…');
   assert.equal(taskName(''), '未命名任务');
   assert.equal(taskName(undefined), '未命名任务');
+});
+
+test('supervisorAlive requires a live pid AND a fresh heartbeat (pid-reuse defense)', () => {
+  assert.equal(supervisorAlive({ supervisor: { pid: process.pid, heartbeat: Date.now() } }), true);
+  assert.equal(supervisorAlive({ supervisor: { pid: process.pid, heartbeat: Date.now() - 120_000 } }), false,
+    'alive pid with stale heartbeat = probably pid reuse');
+  assert.equal(supervisorAlive({ supervisor: { pid: process.pid } }), false, 'no heartbeat yet');
+  assert.equal(supervisorAlive({ supervisor: { pid: 999_999_99, heartbeat: Date.now() } }), false);
+  assert.equal(supervisorAlive({}), false);
 });
 
 test('M2 golden path: inbound task → busy guard → codex exec → result → flush delivers', async t => {

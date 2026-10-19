@@ -102,7 +102,9 @@ export async function worker({
   const run = runner || makeLocalRunner(store);
   let release;
   try {
-    release = await store.lock('worker', 0);
+    // refreshMs keeps the lock file mtime fresh — the stale-lock rule in store
+    // (alive pid + old mtime = Windows pid reuse) must never fire on a live worker.
+    release = await store.lock('worker', 0, { refreshMs: 15_000 });
   } catch (e) {
     if (e.code === 'BUSY') return { status: 'already_running' };
     throw e;
@@ -360,6 +362,15 @@ export async function worker({
   }
 }
 
+/** A supervisor counts as alive only when its pid lives AND its heartbeat is fresh —
+ * Windows reuses pids, so a bare isAlive() once mistook AweSun for our supervisor. */
+export function supervisorAlive(state) {
+  const sup = state.supervisor;
+  if (!isAlive(sup?.pid)) return false;
+  const hb = Number(sup.heartbeat) || 0;
+  return hb > 0 && Date.now() - hb < 90_000;
+}
+
 /**
  * Start the bridge through the supervisor (watchdog: crash/hang respawn, backoff).
  * Waits until the worker heartbeat appears.
@@ -371,7 +382,7 @@ export async function startWorker(store = new Store()) {
     throw new LocalError('LOGIN_REQUIRED', '请先扫码绑定微信。');
   }
   const supervisorScript = path.join(path.dirname(fileURLToPath(import.meta.url)), 'supervisor.mjs');
-  if (!isAlive(existing.supervisor?.pid)) {
+  if (!supervisorAlive(existing)) {
     const child = spawn(process.execPath, [supervisorScript], {
       detached: true, stdio: 'ignore', windowsHide: true,
       env: { ...process.env, WECHAT_BRIDGE_STATE_DIR: store.directory },
@@ -382,7 +393,9 @@ export async function startWorker(store = new Store()) {
     await sleep(100);
     const s = await store.read();
     if (receiverRunning(s)) return { status: 'started' };
-    if (!isAlive(s.supervisor?.pid) && i > 5) break; // supervisor gave up (e.g. login race)
+    // a supervisor that exists in state but never heartbeats is bogus (pid reuse) —
+    // the fresh spawn takes over via the stale-lock rule; keep waiting for the worker
+    if (!supervisorAlive(s) && !isAlive(s.supervisor?.pid) && i > 5) break;
   }
   throw new LocalError('START_FAILED', '微信接收服务未能启动。');
 }

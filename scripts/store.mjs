@@ -12,6 +12,10 @@ export function isAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
 }
 
+// A held-but-never-refreshed lock older than this is stale even when its owner pid
+// happens to be alive (Windows pid reuse — see lock() above).
+export const STALE_LOCK_MS = 90_000;
+
 export class Store {
   constructor(directory = process.env.WECHAT_BRIDGE_STATE_DIR || path.join(os.homedir(), '.codex-wechat-bridge')) {
     this.directory = path.resolve(directory);
@@ -55,25 +59,56 @@ export class Store {
       }
     } finally { await fs.rm(tmp, { force: true }); }
   }
-  async lock(name = 'state', waitMs = 3000) {
+  /**
+   * File lock. Long-held locks pass { refreshMs } — the holder refreshes the lock
+   * file's mtime so its freshness proves the holder is genuinely alive.
+   *
+   * Stale-lock rule (v0.1.3): an owner pid that is "alive" but whose lock mtime is
+   * older than STALE_LOCK_MS is treated as dead. Windows aggressively reuses pids:
+   * our supervisor died and a random app (field case: AweSun remote desktop) got
+   * the same pid — without this rule the lock is stuck forever and every start
+   * fails with BUSY/START_FAILED.
+   */
+  async lock(name = 'state', waitMs = 3000, { refreshMs = 0, staleMs = STALE_LOCK_MS } = {}) {
     await this.ensure();
     const file = path.join(this.directory, `${name}.lock`);
     const nonce = randomUUID();
-    const deadline = Date.now() + waitMs;
+    const startedAt = Date.now();
+    const deadline = startedAt + waitMs;
     do {
       try {
         const fd = await fs.open(file, 'wx', 0o600);
-        try { await fd.writeFile(JSON.stringify({ pid: process.pid, nonce })); } finally { await fd.close(); }
-        return async () => {
+        try { await fd.writeFile(JSON.stringify({ pid: process.pid, nonce, startedAt })); } finally { await fd.close(); }
+        let refresher = null;
+        let released = false;
+        const release = async () => {
+          if (released) return;
+          released = true;
+          if (refresher) clearInterval(refresher);
           try {
             if (JSON.parse(await fs.readFile(file, 'utf8')).nonce === nonce) await fs.unlink(file);
           } catch (e) { if (e.code !== 'ENOENT') throw e; }
         };
+        if (refreshMs > 0) {
+          refresher = setInterval(() => {
+            fs.writeFile(file, JSON.stringify({ pid: process.pid, nonce, startedAt }), { flag: 'w' }).catch(() => {});
+          }, refreshMs);
+          refresher.unref();
+        }
+        return release;
       } catch (e) {
-        if (e.code !== 'EEXIST') throw e;
+        // EPERM/EACCES on 'wx' open happens when AV scanners hold the lock file —
+        // treat exactly like contention (EEXIST).
+        if (e.code !== 'EEXIST' && e.code !== 'EPERM' && e.code !== 'EACCES') throw e;
         try {
           const owner = JSON.parse(await fs.readFile(file, 'utf8'));
           if (!isAlive(owner.pid)) { await fs.unlink(file); continue; }
+          const st = await fs.stat(file);
+          if (Date.now() - st.mtimeMs > staleMs) {
+            // pid alive but lock never refreshed → pid reuse or wedged holder → break it
+            await fs.unlink(file);
+            continue;
+          }
         } catch (err) {
           if (err.code === 'ENOENT') continue;
           // A just-created lock may not have its owner written yet.

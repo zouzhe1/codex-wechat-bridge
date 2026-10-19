@@ -45,9 +45,12 @@ export async function supervisor({
 } = {}) {
   let release;
   try {
-    release = await store.lock('supervisor', 0);
+    release = await store.lock('supervisor', 0, { refreshMs: 15_000 });
   } catch (e) {
-    if (e.code === 'BUSY') return { status: 'already_running' };
+    if (e.code === 'BUSY') {
+      log(`supervisor lock busy — another supervisor owns it (or its pid was reused); refusing to double-run`);
+      return { status: 'already_running' };
+    }
     throw e;
   }
 
@@ -65,7 +68,13 @@ export async function supervisor({
 
   const pid = process.pid;
   // Fresh intent: clear any stale stop flag from a previous stop command.
-  await store.update(s => { s.supervisor = { pid, stop: false, startedAt: Date.now() }; }).catch(() => {});
+  // heartbeat lets startWorker/ensureBridgeAlive tell a LIVE supervisor from a
+  // pid that Windows handed to some unrelated app after we died.
+  await store.update(s => { s.supervisor = { pid, stop: false, startedAt: Date.now(), heartbeat: Date.now() }; }).catch(() => {});
+  const supBeat = setInterval(() => {
+    store.update(s => { if (s.supervisor?.pid === pid) s.supervisor.heartbeat = Date.now(); }).catch(() => {});
+  }, 15_000);
+  supBeat.unref();
 
   try {
     const initial = await store.read().catch(() => null);
@@ -130,6 +139,7 @@ export async function supervisor({
     }
   } finally {
     log('supervisor exiting');
+    clearInterval(supBeat);
     await store.update(s => {
       if (s.supervisor?.pid === pid) s.supervisor = { pid: null, stop: false };
     }).catch(() => {});

@@ -223,22 +223,33 @@ test('ensureBridgeAlive revives a dead bridge exactly once per throttle window',
   assert.equal(r2.why, 'throttled', 'second call within 30s is throttled');
   assert.equal(starts, 1);
 
-  // a live supervisor means it is NOT our job to spawn
+  // a live supervisor (fresh heartbeat) means it is NOT our job to spawn
   const dir2 = await tempDir(); t.after(() => cleanup(dir2));
   const store2 = new Store(dir2);
   await store2.update(s => {
     s.account = { token: 'tok' };
-    s.supervisor = { pid: process.pid, stop: false };
+    s.supervisor = { pid: process.pid, stop: false, heartbeat: Date.now() };
   });
   const r3 = await ensureBridgeAlive(store2, { start });
   assert.equal(r3.why, 'supervisor_alive');
   assert.equal(starts, 1);
 
+  // a supervisor pid WITHOUT a fresh heartbeat is a stranger (pid reuse) → we spawn
+  const dir4 = await tempDir(); t.after(() => cleanup(dir4));
+  const store4 = new Store(dir4);
+  await store4.update(s => {
+    s.account = { token: 'tok' };
+    s.supervisor = { pid: process.pid, stop: false, heartbeat: Date.now() - 10 * 60_000 };
+  });
+  const r6 = await ensureBridgeAlive(store4, { start });
+  assert.equal(r6.healed, true, 'stale-heartbeat supervisor must not block the heal');
+  assert.equal(starts, 2);
+
   // no account → never spawn
   const dir3 = await tempDir(); t.after(() => cleanup(dir3));
   const r4 = await ensureBridgeAlive(new Store(dir3), { start });
   assert.equal(r4.why, 'no_account');
-  assert.equal(starts, 1);
+  assert.equal(starts, 2);
 
   // env kill-switch
   process.env.WECHAT_BRIDGE_AUTOHEAL = '0';
